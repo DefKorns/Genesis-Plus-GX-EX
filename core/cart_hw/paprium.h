@@ -20,17 +20,133 @@ Project Little Man
 static mp3dec_t paprium_mp3d;
 static mp3dec_file_info_t paprium_mp3d_info;
 
-static mp3dec_t paprium_mp3d_boss1;
-static mp3dec_file_info_t paprium_mp3d_info_boss1;
+/* Only the track being played stays in RAM, as interleaved stereo (left, right).
+   paprium_mp3_mono is set for a mono track, which plays on both sides */
+static int paprium_mp3_mono;
+static int paprium_mp3_loaded_track = -1;
 
-static mp3dec_t paprium_mp3d_boss2;
-static mp3dec_file_info_t paprium_mp3d_info_boss2;
+static void paprium_mp3_release(void)
+{
+	free(paprium_mp3d_info.buffer);
+	memset(&paprium_mp3d_info, 0, sizeof(paprium_mp3d_info));
+	paprium_mp3_mono = 0;
+	paprium_mp3_loaded_track = -1;
+}
 
-static mp3dec_t paprium_mp3d_boss3;
-static mp3dec_file_info_t paprium_mp3d_info_boss3;
+/* A .wav next to the .mp3 is loaded instead, without decoding */
+static int paprium_wav_load(const char *mp3_path)
+{
+	char path[512];
+	unsigned char head[12], chunk[8], fmt[16], pcm[4096 * 4];
+	uint32_t size, hz = 0, frames = 0, done = 0, got, j;
+	int channels = 0, bits = 0, format = 0, found = 0;
+	mp3d_sample_t *buf;
+	FILE *fp;
+	char *dot;
 
-static mp3dec_t paprium_mp3d_boss4;
-static mp3dec_file_info_t paprium_mp3d_info_boss4;
+	strncpy(path, mp3_path, sizeof(path) - 1);
+	path[sizeof(path) - 1] = 0;
+	dot = strrchr(path, '.');
+	if( !dot || strlen(dot) != 4 )
+		return 0;
+	strcpy(dot, ".wav");
+
+	fp = fopen(path, "rb");
+	if( !fp )
+		return 0;
+
+	if( fread(head, 1, 12, fp) != 12 || memcmp(head, "RIFF", 4) || memcmp(head + 8, "WAVE", 4) ) {
+		fclose(fp);
+		return 0;
+	}
+
+	while( fread(chunk, 1, 8, fp) == 8 ) {
+		size = chunk[4] | (chunk[5] << 8) | (chunk[6] << 16) | ((uint32_t) chunk[7] << 24);
+
+		if( !memcmp(chunk, "fmt ", 4) && size >= 16 ) {
+			if( fread(fmt, 1, 16, fp) != 16 )
+				break;
+			format = fmt[0] | (fmt[1] << 8);
+			channels = fmt[2] | (fmt[3] << 8);
+			hz = fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | ((uint32_t) fmt[7] << 24);
+			bits = fmt[14] | (fmt[15] << 8);
+			if( fseek(fp, (long) (size - 16 + (size & 1)), SEEK_CUR) )
+				break;
+		}
+		else if( !memcmp(chunk, "data", 4) ) {
+			frames = size / 4;
+			found = 1;
+			break;
+		}
+		else if( fseek(fp, (long) (size + (size & 1)), SEEK_CUR) )
+			break;
+	}
+
+	if( !found || !frames || format != 1 || channels != 2 || bits != 16 || !hz ) {
+		fclose(fp);
+		return 0;
+	}
+
+	buf = (mp3d_sample_t *) malloc((size_t) frames * 2 * sizeof(mp3d_sample_t));
+	if( !buf ) {
+		fclose(fp);
+		return 0;
+	}
+
+	while( done < frames ) {
+		got = (frames - done < 4096) ? (frames - done) : 4096;
+		got = (uint32_t) (fread(pcm, 1, (size_t) got * 4, fp) / 4);
+		if( !got )
+			break;
+
+		for( j = 0; j < got; j++ ) {
+			buf[(done + j) * 2]     = (mp3d_sample_t) (pcm[j * 4]     | (pcm[j * 4 + 1] << 8));
+			buf[(done + j) * 2 + 1] = (mp3d_sample_t) (pcm[j * 4 + 2] | (pcm[j * 4 + 3] << 8));
+		}
+		done += got;
+	}
+	fclose(fp);
+
+	if( !done ) {
+		free(buf);
+		return 0;
+	}
+
+	memset(&paprium_mp3d_info, 0, sizeof(paprium_mp3d_info));
+	paprium_mp3d_info.buffer = buf;
+	paprium_mp3d_info.samples = (size_t) done * 2;
+	paprium_mp3d_info.channels = 2;
+	paprium_mp3d_info.hz = (int) hz;
+	paprium_mp3_mono = 0;
+	return 1;
+}
+
+static int paprium_mp3_load(int track, const char *name)
+{
+	if( track == paprium_mp3_loaded_track && paprium_mp3d_info.buffer )
+		return 1;
+
+	paprium_mp3_release();
+
+	if( paprium_wav_load(name) ) {
+		paprium_mp3_loaded_track = track;
+		return 1;
+	}
+
+	if( mp3dec_load(&paprium_mp3d, name, &paprium_mp3d_info, NULL, NULL) ||
+	    !paprium_mp3d_info.buffer || !paprium_mp3d_info.samples ) {
+		paprium_mp3_release();
+		return 0;
+	}
+
+	if( paprium_mp3d_info.channels == 1 ) {
+		paprium_mp3d_info.samples *= 2;
+		paprium_mp3_mono = 1;
+	}
+
+	paprium_mp3_loaded_track = track;
+	return 1;
+}
 
 static int paprium_track_last;
 extern char g_rom_dir[256];
@@ -228,36 +344,10 @@ static void paprium_load_mp3(int track, int reload)
 
 	paprium_s.music_tick = 0;
 
-	if( track != PAPRIUM_BOSS1 && track != PAPRIUM_BOSS2 && track != PAPRIUM_BOSS3 && track != PAPRIUM_BOSS4 ) {
-		if( mp3dec_load(&paprium_mp3d, name, &paprium_mp3d_info, NULL, NULL) ) {
-			paprium_s.music_track = 0;
-			return;
-		}
+	if( !paprium_mp3_load(track, name) ) {
+		paprium_s.music_track = 0;
+		return;
 	}
-}
-
-
-static void paprium_load_mp3_boss()
-{
-	static char name[512];
-
-#ifdef _WIN32
-	sprintf(error_str, "%s\\paprium\\", g_rom_dir);
-#else
-	sprintf(error_str, "%s/paprium/", g_rom_dir);
-#endif
-
-	sprintf(name, "%s04 Drumbass Boss.mp3", error_str);
-	mp3dec_load(&paprium_mp3d_boss1, name, &paprium_mp3d_info_boss1, NULL, NULL);
-
-	sprintf(name, "%s22 Hardcore BP1.mp3", error_str);
-	mp3dec_load(&paprium_mp3d_boss2, name, &paprium_mp3d_info_boss2, NULL, NULL);
-
-	sprintf(name, "%s11 Hardcore BP2.mp3", error_str);
-	mp3dec_load(&paprium_mp3d_boss3, name, &paprium_mp3d_info_boss3, NULL, NULL);
-
-	sprintf(name, "%s38 Hardcore BP3.mp3", error_str);
-	mp3dec_load(&paprium_mp3d_boss4, name, &paprium_mp3d_info_boss4, NULL, NULL);
 }
 
 
@@ -456,25 +546,18 @@ static void paprium_music_synth(int *out_l, int *out_r)
 
 #if 1
 	if( paprium_s.music_track ) {
-		if( paprium_s.music_track == PAPRIUM_BOSS1 ) {
-			l = paprium_mp3d_info_boss1.buffer[paprium_s.mp3_ptr];
-			r = paprium_mp3d_info_boss1.buffer[paprium_s.mp3_ptr];
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS2 ) {
-			l = paprium_mp3d_info_boss2.buffer[paprium_s.mp3_ptr];
-			r = paprium_mp3d_info_boss2.buffer[paprium_s.mp3_ptr];
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS3 ) {
-			l = paprium_mp3d_info_boss3.buffer[paprium_s.mp3_ptr];
-			r = paprium_mp3d_info_boss3.buffer[paprium_s.mp3_ptr];
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS4 ) {
-			l = paprium_mp3d_info_boss4.buffer[paprium_s.mp3_ptr];
-			r = paprium_mp3d_info_boss4.buffer[paprium_s.mp3_ptr];
-		}
-		else {
-			l = paprium_mp3d_info.buffer[paprium_s.mp3_ptr];
-			r = paprium_mp3d_info.buffer[paprium_s.mp3_ptr];
+		if( paprium_mp3d_info.samples && paprium_s.mp3_ptr >= (int) paprium_mp3d_info.samples )
+			paprium_s.mp3_ptr %= (int) paprium_mp3d_info.samples;
+
+		if( paprium_mp3d_info.buffer ) {
+			if( paprium_mp3_mono ) {
+				l = paprium_mp3d_info.buffer[paprium_s.mp3_ptr >> 1];
+				r = l;
+			}
+			else {
+				l = paprium_mp3d_info.buffer[paprium_s.mp3_ptr];
+				r = ((size_t) paprium_s.mp3_ptr + 1 < paprium_mp3d_info.samples) ? paprium_mp3d_info.buffer[paprium_s.mp3_ptr + 1] : l;
+			}
 		}
 
 
@@ -490,26 +573,8 @@ static void paprium_music_synth(int *out_l, int *out_r)
 		}
 
 
-		if( paprium_s.music_track == PAPRIUM_BOSS1 ) {
-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss1.samples)
-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss1.samples;
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS2 ) {
-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss2.samples)
-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss2.samples;
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS3 ) {
-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss3.samples)
-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss3.samples;
-		}
-		else if( paprium_s.music_track == PAPRIUM_BOSS4 ) {
-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss4.samples)
-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss4.samples;
-		}
-		else {
-			if( paprium_s.mp3_ptr >= paprium_mp3d_info.samples)
-				paprium_s.mp3_ptr -= paprium_mp3d_info.samples;
-		}
+		if( paprium_mp3d_info.samples && paprium_s.mp3_ptr >= (int) paprium_mp3d_info.samples )
+			paprium_s.mp3_ptr -= (int) paprium_mp3d_info.samples;
 	}
 
 	*out_l = l;
@@ -2850,13 +2915,8 @@ static void paprium_reset()
 {
 	paprium_init();
 
+	paprium_mp3_release();
 	mp3dec_init(&paprium_mp3d);
-
-	mp3dec_init(&paprium_mp3d_boss1);
-	mp3dec_init(&paprium_mp3d_boss2);
-	mp3dec_init(&paprium_mp3d_boss3);
-	mp3dec_init(&paprium_mp3d_boss4);
-	paprium_load_mp3_boss();
 
 
 	//extern int trace_start;
