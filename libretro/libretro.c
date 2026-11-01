@@ -3794,6 +3794,13 @@ void retro_unload_game(void)
    if (system_hw == SYSTEM_MCD)
       bram_save();
 
+#ifndef _WIN32
+   {
+      extern void paprium_mp3_shutdown(void);
+      paprium_mp3_shutdown();
+   }
+#endif
+
    audio_shutdown();
 
    if (md_ntsc)

@@ -33,6 +33,90 @@ static void paprium_mp3_release(void)
 	paprium_mp3_loaded_track = -1;
 }
 
+#ifndef _WIN32
+#include <pthread.h>
+#define PAPRIUM_MP3_ASYNC
+#endif
+
+#ifdef PAPRIUM_MP3_ASYNC
+/* An .mp3 takes seconds to decode. A second thread decodes the first PAPRIUM_MP3_HEAD frames, which
+   paprium_mp3_poll starts playing at once, and then the whole track, which replaces the head in place */
+#define PAPRIUM_MP3_HEAD 800
+
+static pthread_t paprium_mp3_thread;
+static int paprium_mp3_running;
+static int paprium_mp3_installed;
+static int paprium_mp3_pending_track = -1;
+static volatile int paprium_mp3_head_ready;
+static volatile int paprium_mp3_done;
+static volatile int paprium_mp3_abort;
+static int paprium_mp3_frames;
+static char paprium_mp3_job_name[512];
+static mp3dec_t paprium_mp3_job_dec;
+static mp3dec_file_info_t paprium_mp3_job_head;
+static mp3dec_file_info_t paprium_mp3_job_full;
+static int paprium_mp3_job_head_err;
+static int paprium_mp3_job_full_err;
+
+static int paprium_mp3_head_progress(void *user_data, size_t file_size, uint64_t offset, mp3dec_frame_info_t *info)
+{
+	return (paprium_mp3_abort || ++paprium_mp3_frames >= PAPRIUM_MP3_HEAD) ? MP3D_E_USER : 0;
+}
+
+static int paprium_mp3_full_progress(void *user_data, size_t file_size, uint64_t offset, mp3dec_frame_info_t *info)
+{
+	return paprium_mp3_abort ? MP3D_E_USER : 0;
+}
+
+static int paprium_mp3_usable(const mp3dec_file_info_t *info, int err)
+{
+	return !err && info->buffer && info->samples;
+}
+
+static void *paprium_mp3_worker(void *arg)
+{
+	memset(&paprium_mp3_job_head, 0, sizeof(paprium_mp3_job_head));
+	memset(&paprium_mp3_job_full, 0, sizeof(paprium_mp3_job_full));
+	paprium_mp3_frames = 0;
+
+	paprium_mp3_job_head_err = mp3dec_load(&paprium_mp3_job_dec, paprium_mp3_job_name, &paprium_mp3_job_head, paprium_mp3_head_progress, NULL);
+
+	if( paprium_mp3_job_head_err == MP3D_E_USER && !paprium_mp3_abort && paprium_mp3_job_head.buffer && paprium_mp3_job_head.samples ) {
+		__atomic_store_n(&paprium_mp3_head_ready, 1, __ATOMIC_RELEASE);
+		paprium_mp3_job_full_err = mp3dec_load(&paprium_mp3_job_dec, paprium_mp3_job_name, &paprium_mp3_job_full, paprium_mp3_full_progress, NULL);
+	} else {
+		paprium_mp3_job_full = paprium_mp3_job_head;
+		paprium_mp3_job_full_err = paprium_mp3_job_head_err;
+		memset(&paprium_mp3_job_head, 0, sizeof(paprium_mp3_job_head));
+	}
+
+	__atomic_store_n(&paprium_mp3_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void paprium_mp3_cancel(void)
+{
+	if( !paprium_mp3_running )
+		return;
+
+	paprium_mp3_abort = 1;
+	pthread_join(paprium_mp3_thread, NULL);
+	paprium_mp3_running = 0;
+	free(paprium_mp3_job_head.buffer);
+	free(paprium_mp3_job_full.buffer);
+	memset(&paprium_mp3_job_head, 0, sizeof(paprium_mp3_job_head));
+	memset(&paprium_mp3_job_full, 0, sizeof(paprium_mp3_job_full));
+	paprium_mp3_pending_track = -1;
+	paprium_mp3_installed = 0;
+}
+
+void paprium_mp3_shutdown(void)
+{
+	paprium_mp3_cancel();
+	paprium_mp3_release();
+}
+#endif
+
 /* A .wav next to the .mp3 is loaded instead, without decoding */
 static int paprium_wav_load(const char *mp3_path)
 {
@@ -126,12 +210,33 @@ static int paprium_mp3_load(int track, const char *name)
 	if( track == paprium_mp3_loaded_track && paprium_mp3d_info.buffer )
 		return 1;
 
+#ifdef PAPRIUM_MP3_ASYNC
+	if( paprium_mp3_running && track == paprium_mp3_pending_track )
+		return 1;
+
+	paprium_mp3_cancel();
+#endif
+
 	paprium_mp3_release();
 
 	if( paprium_wav_load(name) ) {
 		paprium_mp3_loaded_track = track;
 		return 1;
 	}
+
+#ifdef PAPRIUM_MP3_ASYNC
+	strncpy(paprium_mp3_job_name, name, sizeof(paprium_mp3_job_name) - 1);
+	paprium_mp3_job_name[sizeof(paprium_mp3_job_name) - 1] = 0;
+	paprium_mp3_done = 0;
+	paprium_mp3_head_ready = 0;
+	paprium_mp3_abort = 0;
+	paprium_mp3_installed = 0;
+	if( !pthread_create(&paprium_mp3_thread, NULL, paprium_mp3_worker, NULL) ) {
+		paprium_mp3_running = 1;
+		paprium_mp3_pending_track = track;
+		return 1;
+	}
+#endif
 
 	if( mp3dec_load(&paprium_mp3d, name, &paprium_mp3d_info, NULL, NULL) ||
 	    !paprium_mp3d_info.buffer || !paprium_mp3d_info.samples ) {
@@ -270,6 +375,62 @@ uint8 paprium_volume_table[256] =
     0xF9, 0xF9, 0xFA, 0xFA, 0xFB, 0xFB, 0xFC, 0xFC, 0xFC, 0xFD, 0xFD, 0xFE, 0xFE, 0xFE, 0xFF, 0xFF, 
 };
 
+
+#ifdef PAPRIUM_MP3_ASYNC
+static void paprium_mp3_adopt(mp3dec_file_info_t *info)
+{
+	paprium_mp3d_info = *info;
+	paprium_mp3_mono = 0;
+	if( paprium_mp3d_info.channels == 1 ) {
+		paprium_mp3d_info.samples *= 2;
+		paprium_mp3_mono = 1;
+	}
+	memset(info, 0, sizeof(*info));
+}
+
+static void paprium_mp3_poll(void)
+{
+	if( !paprium_mp3_running )
+		return;
+
+	if( !paprium_mp3_installed && __atomic_load_n(&paprium_mp3_head_ready, __ATOMIC_ACQUIRE) ) {
+		paprium_mp3_adopt(&paprium_mp3_job_head);
+		paprium_mp3_loaded_track = paprium_mp3_pending_track;
+		paprium_s.mp3_ptr = 0;
+		paprium_s.music_tick = 0;
+		paprium_mp3_installed = 1;
+	}
+
+	if( !__atomic_load_n(&paprium_mp3_done, __ATOMIC_ACQUIRE) )
+		return;
+
+	pthread_join(paprium_mp3_thread, NULL);
+	paprium_mp3_running = 0;
+
+	if( paprium_mp3_usable(&paprium_mp3_job_full, paprium_mp3_job_full_err) ) {
+		void *head = paprium_mp3d_info.buffer;
+		int ptr = paprium_s.mp3_ptr;
+
+		paprium_mp3_adopt(&paprium_mp3_job_full);
+		if( paprium_mp3_installed ) {
+			free(head);
+			paprium_s.mp3_ptr = (ptr < (int) paprium_mp3d_info.samples) ? ptr : 0;
+		} else {
+			paprium_mp3_loaded_track = paprium_mp3_pending_track;
+			paprium_s.mp3_ptr = 0;
+			paprium_s.music_tick = 0;
+		}
+	} else {
+		free(paprium_mp3_job_full.buffer);
+		memset(&paprium_mp3_job_full, 0, sizeof(paprium_mp3_job_full));
+		if( !paprium_mp3_installed )
+			paprium_s.music_track = 0;
+	}
+
+	paprium_mp3_pending_track = -1;
+	paprium_mp3_installed = 0;
+}
+#endif
 
 static void paprium_load_mp3(int track, int reload)
 {
@@ -754,6 +915,10 @@ void paprium_audio(int cycles)
 {
 	int lcv;
 	int samples = blip_clocks_needed(snd.blips[3], cycles);
+
+#ifdef PAPRIUM_MP3_ASYNC
+	paprium_mp3_poll();
+#endif
 
 
 #if DEBUG_MODE
